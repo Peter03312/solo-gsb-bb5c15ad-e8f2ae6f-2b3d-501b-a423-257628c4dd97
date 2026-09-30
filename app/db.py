@@ -11,7 +11,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -85,7 +85,32 @@ def init_db() -> None:
     # 触发模型注册
     from . import models  # noqa: F401
 
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _upgrade_columns(engine)
+
+
+def _upgrade_columns(engine: Engine) -> None:
+    """轻量幂等列升级：既有库由旧版本建表时缺少后续新增列，此处按需补齐。
+
+    PostgreSQL 与 SQLite 均支持 ``ADD COLUMN ... DEFAULT FALSE``（存量行回填），
+    无需手工迁移；新库由 ``create_all`` 直接建出完整结构。
+    """
+    inspector = inspect(engine)
+    if "productions" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("productions")}
+    statements = []
+    if "is_cancelled" not in existing:
+        default_false = "0" if engine.dialect.name == "sqlite" else "FALSE"
+        statements.append(
+            f"ALTER TABLE productions ADD COLUMN is_cancelled BOOLEAN "
+            f"NOT NULL DEFAULT {default_false}"
+        )
+    if statements:
+        with engine.begin() as conn:
+            for stmt in statements:
+                conn.execute(text(stmt))
 
 
 @contextmanager

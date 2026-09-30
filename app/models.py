@@ -64,6 +64,11 @@ class Production(Base):
         String(64), ForeignKey("batches.batch_no"), nullable=False, unique=True
     )
     output_qty: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    # 撤销后原单据保留供查询，但不再属于有效谱系：投料边不参与谱系查询/疑似传播，
+    # 产出批次不得再投料；各来源原投料量已在撤销事务内返还。
+    is_cancelled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=false()
+    )
     created_at: Mapped[object] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -72,6 +77,9 @@ class Production(Base):
         back_populates="production", cascade="all, delete-orphan"
     )
     output: Mapped[Batch] = relationship(foreign_keys=[output_no])
+    cancellation: Mapped["ProductionCancellation | None"] = relationship(
+        back_populates="production", uselist=False
+    )
 
     __table_args__ = (
         CheckConstraint("output_qty > 0", name="ck_production_output_positive"),
@@ -123,6 +131,31 @@ class BatchReview(Base):
     )
 
     batch: Mapped[Batch] = relationship(foreign_keys=[batch_no])
+
+
+class ProductionCancellation(Base):
+    """生产单撤销记录：生产单录入错误后，操作员凭产出批次编号 + 撤销原因撤销该单。
+
+    每个（未撤销的）生产单至多一条撤销；撤销在同一事务内返还各来源的原投料量。
+    撤销后原生产单（productions/production_inputs 行）保留供查询，但被排除出
+    有效谱系：投料边不再进入谱系查询与疑似隔离传播，产出批次不得再投料。
+    """
+
+    __tablename__ = "production_cancellations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    production_id: Mapped[int] = mapped_column(
+        ForeignKey("productions.id"), nullable=False, unique=True
+    )
+    output_no: Mapped[str] = mapped_column(
+        String(64), ForeignKey("batches.batch_no"), nullable=False, unique=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    cancelled_at: Mapped[object] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    production: Mapped[Production] = relationship(back_populates="cancellation")
 
 
 class IdempotencyKey(Base):

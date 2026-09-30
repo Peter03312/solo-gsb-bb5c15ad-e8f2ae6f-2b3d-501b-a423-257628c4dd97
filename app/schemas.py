@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated
 
@@ -67,6 +68,19 @@ class ReviewIn(BaseModel):
         return value
 
 
+class CancelProductionIn(BaseModel):
+    """撤销生产单：凭产出批次编号定位，撤销原因必须非空白。"""
+
+    reason: str = Field(min_length=1, max_length=1000, examples=["产出批次 MIX-1 录入数量有误，整单撤销"])
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("撤销原因不得为空白")
+        return value
+
+
 # ---------- 响应 ----------
 
 
@@ -81,6 +95,8 @@ class BatchOut(_ORMModel):
     remaining_qty: float
     is_suspect: bool
     is_quarantined: bool
+    # 新增且默认 false：非生产产出/未撤销批次行为不变，仅追加字段
+    is_cancelled: bool = False
     note: str | None = None
 
 
@@ -102,6 +118,8 @@ class NodeOut(BaseModel):
     remaining_qty: float
     is_suspect: bool
     is_quarantined: bool
+    # 追加字段：有效谱系中正常节点均为 false；仅为接口一致性保留
+    is_cancelled: bool = False
     depth: int
 
 
@@ -126,3 +144,40 @@ class ReviewOut(BaseModel):
     affected_batch_nos: list[str]
     released_batch_nos: list[str]
     still_quarantined: list[str]
+
+
+# ---------- 生产单撤销 ----------
+
+
+class ReturnLineOut(BaseModel):
+    """撤销时向单个来源批次返还的原投料量。"""
+
+    source_batch_no: str
+    returned_quantity: float
+    remaining_after: float
+
+
+class CancellationOut(BaseModel):
+    output_batch_no: str
+    status: str
+    reason: str
+    cancelled_at: datetime
+    returns: list[ReturnLineOut]
+
+
+class CancellationDetailOut(BaseModel):
+    """原单据上的撤销信息（供查询）。"""
+
+    reason: str
+    cancelled_at: datetime
+
+
+class ProductionDetailOut(_ORMModel):
+    """生产单查询：原单据内容 + 撤销状态；未撤销时 cancellation 为 None。"""
+
+    output_batch_no: str
+    unit: str
+    output_quantity: float
+    is_cancelled: bool
+    inputs: list[ConsumptionOut]
+    cancellation: CancellationDetailOut | None = None
