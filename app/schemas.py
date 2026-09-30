@@ -67,6 +67,18 @@ class ReviewIn(BaseModel):
         return value
 
 
+class CancelIn(BaseModel):
+    # 撤销原因非空、非空白；凭产出批次编号（路径）+ 撤销原因撤销生产单
+    cancel_reason: str = Field(min_length=1, max_length=1000, examples=["产出编号录入错误，实际应为 MIX-1B"])
+
+    @field_validator("cancel_reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("撤销原因不得为空白")
+        return value
+
+
 # ---------- 响应 ----------
 
 
@@ -81,6 +93,7 @@ class BatchOut(_ORMModel):
     remaining_qty: float
     is_suspect: bool
     is_quarantined: bool
+    is_cancelled: bool = False
     note: str | None = None
 
 
@@ -96,17 +109,48 @@ class ProductionOut(_ORMModel):
     inputs: list[ConsumptionOut]
 
 
+class ReturnedInputOut(BaseModel):
+    """撤销时返还给某来源批次的一笔原投料量。"""
+
+    batch_no: str
+    returned_quantity: float
+
+
+class CancellationOut(BaseModel):
+    """生产单撤销结果：产出编号、返还明细、撤销状态。"""
+
+    output_batch_no: str
+    status: str = "CANCELLED"
+    cancel_reason: str
+    cancelled_at: str
+    returned_inputs: list[ReturnedInputOut]
+
+
+class ProductionRecordOut(BaseModel):
+    """生产原单据（含撤销信息），供按产出编号查询。"""
+
+    output_batch_no: str
+    unit: str
+    output_quantity: float
+    inputs: list[ConsumptionOut]
+    is_cancelled: bool
+    cancel_reason: str | None = None
+    cancelled_at: str | None = None
+
+
 class NodeOut(BaseModel):
     batch_no: str
     unit: str
     remaining_qty: float
     is_suspect: bool
     is_quarantined: bool
+    is_cancelled: bool = False
     depth: int
 
 
 class LineageOut(BaseModel):
     batch_no: str
+    is_cancelled: bool = False
     upstream: list[NodeOut]
     downstream: list[NodeOut]
     edges: list[dict[str, str]]

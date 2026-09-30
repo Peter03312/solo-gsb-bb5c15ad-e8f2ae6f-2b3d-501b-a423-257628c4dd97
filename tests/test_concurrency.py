@@ -9,7 +9,13 @@ from app import service
 from app.db import session_scope
 from app.errors import AppError
 from app.models import Batch
-from app.schemas import ProductionIn, RawBatchIn, ReviewIn, SuspectIn
+from app.schemas import (
+    CancelIn,
+    ProductionIn,
+    RawBatchIn,
+    ReviewIn,
+    SuspectIn,
+)
 
 
 def _produce_payload(idx: int, qty: str) -> ProductionIn:
@@ -272,3 +278,197 @@ def test_flag_and_review_concurrent_equivalent_to_serial(engine):
             assert rm1.is_suspect is False and rm1.is_quarantined is False
         else:
             assert rm1.is_suspect is True and rm1.is_quarantined is True
+
+
+# ------------------------------------------------ 生产单撤销相关并发
+
+
+def test_cancel_concurrent_with_consuming_production_equivalent_to_serial(engine):
+    """撤销 MIX-1 与“把 MIX-1 投入 FG-1”并发：
+
+    串行结局 A：投料先提交 -> MIX-1 已被下游投料，撤销被 OUTPUT_ALREADY_CONSUMED
+                拒绝，FG-1 存在、MIX-1 余量被扣；
+    串行结局 B：撤销先提交 -> MIX-1 作废，投料被 BATCH_CANCELLED 拒绝，
+                FG-1 不存在、来源 RM-1 得到返还。
+    两种结局都必须自洽，绝不允许“撤销成功且投料也成功”。
+    """
+    with session_scope() as s:
+        service.register_raw_batch(s, RawBatchIn(batch_no="RM-1", unit="kg", quantity="100"))
+        service.submit_production(
+            s,
+            ProductionIn(
+                output_batch_no="MIX-1",
+                unit="kg",
+                output_quantity=Decimal("100"),
+                inputs=[{"batch_no": "RM-1", "quantity": Decimal("100")}],  # type: ignore[list-item]
+            ),
+        )
+
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+
+    def consume_worker() -> None:
+        barrier.wait()
+        try:
+            with session_scope() as s:
+                service.submit_production(
+                    s,
+                    ProductionIn(
+                        output_batch_no="FG-1",
+                        unit="kg",
+                        output_quantity=Decimal("10"),
+                        inputs=[{"batch_no": "MIX-1", "quantity": Decimal("10")}],  # type: ignore[list-item]
+                    ),
+                )
+            results["consume"] = "ok"
+        except AppError as exc:
+            results["consume"] = exc.code
+        except Exception as exc:
+            results["consume"] = f"ERROR:{type(exc).__name__}:{exc}"
+
+    def cancel_worker() -> None:
+        barrier.wait()
+        try:
+            with session_scope() as s:
+                service.cancel_production(
+                    s, "MIX-1", CancelIn(cancel_reason="录入错误")
+                )
+            results["cancel"] = "ok"
+        except AppError as exc:
+            results["cancel"] = exc.code
+        except Exception as exc:
+            results["cancel"] = f"ERROR:{type(exc).__name__}:{exc}"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda f: f(), [consume_worker, cancel_worker]))
+
+    assert not any(str(v).startswith("ERROR") for v in results.values()), results
+    with session_scope() as s:
+        rm1 = s.get(Batch, "RM-1")
+        mix1 = s.get(Batch, "MIX-1")
+        fg1 = s.get(Batch, "FG-1")
+        prod = service.get_production_record(s, "MIX-1")
+
+        if results["consume"] == "ok":
+            # 结局 A：投料先
+            assert results["cancel"] == "OUTPUT_ALREADY_CONSUMED", results
+            assert fg1 is not None
+            assert prod.is_cancelled is False
+            # RM-1 未得到撤销返还（MIX-1 仍有效，已消耗 100）
+            assert rm1.remaining_qty == Decimal("0.0000")
+            assert mix1.remaining_qty == Decimal("90.0000")
+        else:
+            # 结局 B：撤销先
+            assert results["consume"] == "BATCH_CANCELLED", results
+            assert results["cancel"] == "ok", results
+            assert fg1 is None
+            assert prod.is_cancelled is True
+            # RM-1 收回 MIX-1 当初的 100
+            assert rm1.remaining_qty == Decimal("100.0000")
+            assert mix1.remaining_qty == Decimal("100.0000")
+
+
+def test_cancel_concurrent_with_flag_on_output_equivalent_to_serial(engine):
+    """撤销 MIX-1 与“直接标记 MIX-1 疑似”并发：
+
+    结局 A：标记先 -> 撤销以 OUTPUT_IS_SUSPECT 拒绝，MIX-1 疑似且隔离；
+    结局 B：撤销先 -> 标记仍可作用于保留的批次行（标记本身幂等、恒成功），
+            但 MIX-1 的投料边已失效，不会传播给上游/其它批次。
+    """
+    with session_scope() as s:
+        service.register_raw_batch(s, RawBatchIn(batch_no="RM-1", unit="kg", quantity="100"))
+        service.submit_production(
+            s,
+            ProductionIn(
+                output_batch_no="MIX-1",
+                unit="kg",
+                output_quantity=Decimal("100"),
+                inputs=[{"batch_no": "RM-1", "quantity": Decimal("100")}],  # type: ignore[list-item]
+            ),
+        )
+
+    barrier = threading.Barrier(2)
+    results: dict[str, str] = {}
+
+    def flag_worker() -> None:
+        barrier.wait()
+        try:
+            with session_scope() as s:
+                service.mark_suspect(s, SuspectIn(batch_no="MIX-1"))
+            results["flag"] = "ok"
+        except Exception as exc:
+            results["flag"] = f"ERROR:{type(exc).__name__}:{exc}"
+
+    def cancel_worker() -> None:
+        barrier.wait()
+        try:
+            with session_scope() as s:
+                service.cancel_production(
+                    s, "MIX-1", CancelIn(cancel_reason="录入错误")
+                )
+            results["cancel"] = "ok"
+        except AppError as exc:
+            results["cancel"] = exc.code
+        except Exception as exc:
+            results["cancel"] = f"ERROR:{type(exc).__name__}:{exc}"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(lambda f: f(), [flag_worker, cancel_worker]))
+
+    assert results["flag"] == "ok", results
+    assert not any(str(v).startswith("ERROR") for v in results.values()), results
+    assert results["cancel"] in ("ok", "OUTPUT_IS_SUSPECT"), results
+
+    with session_scope() as s:
+        rm1 = s.get(Batch, "RM-1")
+        mix1 = s.get(Batch, "MIX-1")
+        if results["cancel"] == "OUTPUT_IS_SUSPECT":
+            assert mix1.is_suspect is True and mix1.is_quarantined is True
+            assert rm1.remaining_qty == Decimal("0.0000")  # 未返还
+        else:
+            # 撤销先：边已失效，RM-1 不受 MIX-1 疑似影响，且收到返还
+            assert rm1.is_quarantined is False
+            assert rm1.remaining_qty == Decimal("100.0000")
+            assert service.get_production_record(s, "MIX-1").is_cancelled is True
+
+
+def test_duplicate_concurrent_cancels_only_one_succeeds(engine):
+    """两个相同撤销并发：恰好一个成功、一个 PRODUCTION_ALREADY_CANCELLED，
+    来源余量只返还一次。"""
+    with session_scope() as s:
+        service.register_raw_batch(s, RawBatchIn(batch_no="RM-1", unit="kg", quantity="100"))
+        service.submit_production(
+            s,
+            ProductionIn(
+                output_batch_no="MIX-1",
+                unit="kg",
+                output_quantity=Decimal("50"),
+                inputs=[{"batch_no": "RM-1", "quantity": Decimal("50")}],  # type: ignore[list-item]
+            ),
+        )
+
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+
+    def worker(idx: int) -> None:
+        barrier.wait()
+        try:
+            with session_scope() as s:
+                service.cancel_production(
+                    s, "MIX-1", CancelIn(cancel_reason=f"原因{idx}")
+                )
+            results.append("ok")
+        except AppError as exc:
+            results.append(exc.code)
+        except Exception as exc:
+            results.append(f"ERROR:{type(exc).__name__}:{exc}")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(worker, range(2)))
+
+    assert results.count("ok") == 1, results
+    assert results.count("PRODUCTION_ALREADY_CANCELLED") == 1, results
+    with session_scope() as s:
+        # 只返还一次：100 - 50 + 50 == 100
+        assert s.get(Batch, "RM-1").remaining_qty == Decimal("100.0000")
+        assert service.get_production_record(s, "MIX-1").is_cancelled is True

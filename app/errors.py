@@ -44,6 +44,61 @@ def batch_not_suspect(batch_no: str) -> AppError:
     )
 
 
+def production_not_found(batch_no: str) -> AppError:
+    return AppError(
+        "PRODUCTION_NOT_FOUND",
+        f"批次 {batch_no!r} 不是生产产出批次（无对应生产单），无可撤销的生产单",
+        404,
+        details={"batch_no": batch_no},
+    )
+
+
+def production_already_cancelled(batch_no: str) -> AppError:
+    return AppError(
+        "PRODUCTION_ALREADY_CANCELLED",
+        f"产出批次 {batch_no!r} 的生产单已撤销，不得重复撤销",
+        409,
+        details={"batch_no": batch_no},
+    )
+
+
+def output_already_consumed(batch_no: str, consumer_nos: list[str]) -> AppError:
+    return AppError(
+        "OUTPUT_ALREADY_CONSUMED",
+        f"产出批次 {batch_no!r} 已被后续生产投料（{', '.join(consumer_nos)}），"
+        "仅允许撤销从未被后续生产投料的产出",
+        409,
+        details={"batch_no": batch_no, "consumed_by": sorted(consumer_nos)},
+    )
+
+
+def output_is_suspect(batch_no: str) -> AppError:
+    return AppError(
+        "OUTPUT_IS_SUSPECT",
+        f"产出批次 {batch_no!r} 当前为疑似批次，须先经质检复核撤销疑似后方可撤销生产单",
+        409,
+        details={"batch_no": batch_no},
+    )
+
+
+def production_has_review(batch_no: str) -> AppError:
+    return AppError(
+        "PRODUCTION_HAS_REVIEW",
+        f"产出批次 {batch_no!r} 存在质检复核记录，有复核记录的生产单不得撤销",
+        409,
+        details={"batch_no": batch_no},
+    )
+
+
+def batch_cancelled(batch_no: str) -> AppError:
+    return AppError(
+        "BATCH_CANCELLED",
+        f"批次 {batch_no!r} 为已撤销生产单的产出，已撤销产出不得再投料",
+        409,
+        details={"batch_no": batch_no},
+    )
+
+
 def insufficient(batch_no: str, requested: object, remaining: object) -> AppError:
     return AppError(
         "INSUFFICIENT_BALANCE",

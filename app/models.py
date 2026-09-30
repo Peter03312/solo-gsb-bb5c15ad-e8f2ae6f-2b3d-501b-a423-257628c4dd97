@@ -67,6 +67,15 @@ class Production(Base):
     created_at: Mapped[object] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # 撤销（作废）：录入错误的生产单可整单撤销。撤销后行保留（原单据可查），
+    # 但其投料边不再进入有效谱系/疑似传播，产出批次不得再投料。
+    is_cancelled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=false(), default=False
+    )
+    cancel_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cancelled_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     inputs: Mapped[list["ProductionInput"]] = relationship(
         back_populates="production", cascade="all, delete-orphan"

@@ -12,10 +12,13 @@ from .errors import AppError
 from .models import Batch, Production
 from .schemas import (
     BatchOut,
+    CancellationOut,
+    CancelIn,
     DescendantsOut,
     LineageOut,
     ProductionIn,
     ProductionOut,
+    ProductionRecordOut,
     RawBatchIn,
     ReviewIn,
     ReviewOut,
@@ -25,7 +28,7 @@ from .schemas import (
 router = APIRouter()
 
 
-def _batch_out(batch: Batch) -> dict[str, Any]:
+def _batch_out(batch: Batch, is_cancelled: bool = False) -> dict[str, Any]:
     return {
         "batch_no": batch.batch_no,
         "unit": batch.unit,
@@ -33,6 +36,7 @@ def _batch_out(batch: Batch) -> dict[str, Any]:
         "remaining_qty": float(batch.remaining_qty),
         "is_suspect": batch.is_suspect,
         "is_quarantined": batch.is_quarantined,
+        "is_cancelled": is_cancelled,
         "note": batch.note,
     }
 
@@ -46,6 +50,30 @@ def _production_out(prod: Production, unit: str) -> dict[str, Any]:
             {"batch_no": pi.source_no, "quantity": float(pi.qty)}
             for pi in sorted(prod.inputs, key=lambda x: x.id)
         ],
+    }
+
+
+def _production_record_out(prod: Production, unit: str) -> dict[str, Any]:
+    """原单据查询响应：在生产单基础上附带撤销信息。"""
+    cancelled_at = prod.cancelled_at
+    if cancelled_at is not None:
+        # SQLite 取回 naive datetime，统一为带时区的 ISO 8601 字符串
+        if cancelled_at.tzinfo is None:
+            from datetime import timezone
+
+            cancelled_at = cancelled_at.replace(tzinfo=timezone.utc)
+        cancelled_at = cancelled_at.isoformat()
+    return {
+        "output_batch_no": prod.output_no,
+        "unit": unit,
+        "output_quantity": float(prod.output_qty),
+        "inputs": [
+            {"batch_no": pi.source_no, "quantity": float(pi.qty)}
+            for pi in sorted(prod.inputs, key=lambda x: x.id)
+        ],
+        "is_cancelled": prod.is_cancelled,
+        "cancel_reason": prod.cancel_reason,
+        "cancelled_at": cancelled_at,
     }
 
 
@@ -127,7 +155,8 @@ def get_batch(batch_no: str, session: SessionDep) -> dict[str, Any]:
         from .errors import batch_not_found
 
         raise batch_not_found(batch_no)
-    return _batch_out(batch)
+    is_cancelled = service._is_cancelled_output(session, batch_no)
+    return _batch_out(batch, is_cancelled)
 
 
 @router.get("/batches/{batch_no}/lineage", response_model=LineageOut)
@@ -192,3 +221,53 @@ def review_suspect(
     )
     response.status_code = code
     return result
+
+
+@router.post(
+    "/productions/{output_no}/cancellation",
+    response_model=CancellationOut,
+    status_code=status.HTTP_200_OK,
+)
+def cancel_production(
+    output_no: str,
+    body: CancelIn,
+    session: SessionDep,
+    request: Request,
+    response: Response,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> dict[str, Any]:
+    """撤销录入错误的生产单：凭产出批次编号 + 非空撤销原因。
+
+    在同一事务内返还各来源原投料量、作废产出（不得再投料）与投料边
+    （不再进入有效谱系/疑似传播）。必须携带幂等键。
+    """
+    if not idempotency_key:
+        raise AppError(
+            "IDEMPOTENCY_KEY_REQUIRED",
+            "写操作必须携带 Idempotency-Key 请求头以支持安全重试",
+            400,
+        )
+
+    payload = body.model_dump(mode="json")
+
+    def action() -> tuple[int, dict[str, Any]]:
+        return status.HTTP_200_OK, service.cancel_production(session, output_no, body)
+
+    code, result = service.idempotent(
+        session,
+        method=request.method,
+        path=request.url.path,
+        key=idempotency_key,
+        payload=payload,
+        action=action,
+    )
+    response.status_code = code
+    return result
+
+
+@router.get("/productions/{output_no}", response_model=ProductionRecordOut)
+def get_production(output_no: str, session: SessionDep) -> dict[str, Any]:
+    """按产出编号查询生产原单据（未撤销单据同样可查，附撤销状态与原因）。"""
+    prod = service.get_production_record(session, output_no)
+    output = session.get(Batch, output_no)
+    return _production_record_out(prod, output.unit if output is not None else "")

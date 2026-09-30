@@ -11,7 +11,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -86,6 +86,51 @@ def init_db() -> None:
     from . import models  # noqa: F401
 
     Base.metadata.create_all(bind=get_engine())
+    _migrate_additive_columns(get_engine())
+
+
+def _migrate_additive_columns(engine: Engine) -> None:
+    """对既有数据库做纯增量补列（新字段均可空/有默认值，不触碰历史数据）。
+
+    历史版本的 productions 表没有撤销字段，这里以 ALTER TABLE ... ADD COLUMN
+    补齐；全新库由 create_all 直接带列创建，检查到列已存在则跳过。
+
+    注意：必须在开启写事务之前完成 inspection——SQLite 写事务以
+    BEGIN IMMEDIATE 持有全库写锁，若在同一写事务内再开第二个连接做
+    inspector 查询会自死锁（busy_timeout 后报 database is locked）。
+    """
+    # (列名, PostgreSQL 列定义, SQLite 列定义)：仅新增可空或带默认值的列
+    additions: dict[str, list[tuple[str, str, str]]] = {
+        "productions": [
+            (
+                "is_cancelled",
+                "BOOLEAN NOT NULL DEFAULT FALSE",
+                "BOOLEAN NOT NULL DEFAULT 0",
+            ),
+            ("cancel_reason", "TEXT", "TEXT"),
+            ("cancelled_at", "TIMESTAMPTZ", "DATETIME"),
+        ],
+    }
+
+    inspector = inspect(engine)
+    missing: list[tuple[str, str, str]] = []
+    is_pg = engine.dialect.name == "postgresql"
+    for table, columns in additions.items():
+        if not inspector.has_table(table):
+            continue
+        existing = {col["name"] for col in inspector.get_columns(table)}
+        for name, pg_def, sqlite_def in columns:
+            if name in existing:
+                continue
+            missing.append((table, name, pg_def if is_pg else sqlite_def))
+
+    if not missing:
+        return
+
+    # 再用单一写事务一次性补列
+    with engine.begin() as conn:
+        for table, name, column_def in missing:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {column_def}"))
 
 
 @contextmanager
